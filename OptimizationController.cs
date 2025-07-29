@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Data.Entity;
@@ -666,12 +666,28 @@ namespace KeySys.BaseMultiTenant.Controllers
         private async Task<string> EnqueueCrossAllCustomersOptimizationAsync(CustomerBillingPeriod billPeriod, int tenantId, string serviceProviderIds,
             string awsAccessKey, string awsSecretAccessKey, string customerOptimizationQueueName, long optimizationSessionId, SiteType siteType, List<DateTime> endDateList)
         {
+            // DUPLICATION FIX: Enhanced cross-provider optimization to prevent duplicate customer/session entries
+            // - Added GroupBy deduplication in GetCrossCustomerOptimization method
+            // - Added unique customer tracking in processing loops
+            // - Added database checks to prevent duplicate OptimizationCustomerProcessing records
+            
             var portalType = PortalTypes.CrossProvider;
             var billingPeriodEnd = endDateList[endDateList.Count - 1];
             var billingPeriodStart = endDateList[0].AddMonths(-1);
             var allCustomer = GetCrossCustomerOptimization(billPeriod, tenantId, serviceProviderIds, endDateList, billingPeriodStart, billingPeriodEnd);
-            var revCustomers = allCustomer.Where(x => x.RevCustomerId != null && x.RevIntegrationAuthId != null).ToList();
-            var amopCustomers = allCustomer.Where(x => x.RevCustomerId == null || x.RevIntegrationAuthId == null).ToList();
+            
+            // Apply additional deduplication before splitting customers
+            var distinctCustomers = allCustomer
+                .GroupBy(x => new { 
+                    x.RevCustomerId, 
+                    x.AmopCustomerId, 
+                    x.SiteId 
+                })
+                .Select(g => g.First())
+                .ToList();
+            
+            var revCustomers = distinctCustomers.Where(x => x.RevCustomerId != null && x.RevIntegrationAuthId != null).ToList();
+            var amopCustomers = distinctCustomers.Where(x => x.RevCustomerId == null || x.RevIntegrationAuthId == null).ToList();
             if (!revCustomers.Any() && !amopCustomers.Any())
             {
                 return "No customers found with eligible SIMs";
@@ -694,9 +710,27 @@ namespace KeySys.BaseMultiTenant.Controllers
 
                     if (siteType == SiteType.Rev)
                     {
+                        // Track processed customers to prevent duplicates
+                        var processedCustomerIds = new HashSet<string>();
+                        
                         for (var i = 0; i < revCustomers.Count; i++)
                         {
                             var customer = revCustomers[i];
+                            
+                            // Skip if this customer has already been processed in this session
+                            var customerKey = $"{customer.RevCustomerId}_{customer.SiteId}_{optimizationSessionId}";
+                            if (processedCustomerIds.Contains(customerKey))
+                                continue;
+                                
+                            // Check if customer already exists in this optimization session
+                            var existingProcessing = altaWrxDb.OptimizationCustomerProcessings
+                                .FirstOrDefault(x => x.CustomerId == customer.RevCustomerId 
+                                    && x.SessionId == optimizationSessionId);
+                            if (existingProcessing != null)
+                                continue;
+                            
+                            processedCustomerIds.Add(customerKey);
+                            
                             var delaySeconds = Math.Min(i * 2, 900);
                             var isLastInstance = false;
                             if (i == revCustomers.Count - 1)
@@ -720,9 +754,27 @@ namespace KeySys.BaseMultiTenant.Controllers
 
                     if (siteType == SiteType.AMOP)
                     {
+                        // Track processed AMOP customers to prevent duplicates
+                        var processedAmopCustomerIds = new HashSet<string>();
+                        
                         for (var i = 0; i < amopCustomers.Count; i++)
                         {
                             var amopCustomer = amopCustomers[i];
+                            
+                            // Skip if this AMOP customer has already been processed in this session
+                            var customerKey = $"{amopCustomer.AmopCustomerId}_{amopCustomer.SiteId}_{optimizationSessionId}";
+                            if (processedAmopCustomerIds.Contains(customerKey))
+                                continue;
+                                
+                            // Check if AMOP customer already exists in this optimization session
+                            var existingProcessing = altaWrxDb.OptimizationCustomerProcessings
+                                .FirstOrDefault(x => x.CustomerId == amopCustomer.AmopCustomerId.ToString() 
+                                    && x.SessionId == optimizationSessionId);
+                            if (existingProcessing != null)
+                                continue;
+                            
+                            processedAmopCustomerIds.Add(customerKey);
+                            
                             var delaySeconds = Math.Min(i * 2, 900);
                             var isLastInstance = false;
                             if (i == amopCustomers.Count - 1)
@@ -772,7 +824,19 @@ namespace KeySys.BaseMultiTenant.Controllers
                         && endDateList.Any(date => date.Day == x.CustomerBillPeriodEndDay))
                     .Select(x => x.id)
                     .ToList();
-            return allCustomer.Where(x => siteIdList.Any(siteId => siteId == x.SiteId)).ToList();
+            
+            // Apply distinct logic to prevent duplicates based on unique customer identifiers
+            var filteredCustomers = allCustomer.Where(x => siteIdList.Any(siteId => siteId == x.SiteId))
+                .GroupBy(x => new { 
+                    x.RevCustomerId, 
+                    x.AmopCustomerId, 
+                    x.SiteId,
+                    x.RevIntegrationAuthId 
+                })
+                .Select(g => g.First()) // Take first occurrence of each unique customer combination
+                .ToList();
+                
+            return filteredCustomers;
         }
 
         private IList<IOptimizationCustomersGetResult> GetOptimizationCustomers(int? tenantId, int? serviceProviderId, int? billPeriodId, PortalTypes portalType, DateTime? customerStartDate, DateTime? customerEndDate, string crossServiceProviderIds)
